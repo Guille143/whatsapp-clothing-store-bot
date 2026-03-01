@@ -29,45 +29,65 @@ def verify_webhook(request: Request):
         return Response(content=challenge, media_type="text/plain")
     raise HTTPException(status_code=403, detail="Webhook verification failed")
 
+from fastapi import FastAPI, Request, Response, HTTPException
+import json
+import os
+
 @app.post("/webhook")
 async def receive_webhook(payload: dict):
-    """
-    WhatsApp Cloud API manda eventos por POST (messages, statuses, etc.)
-    Nosotros respondemos solo cuando llega un mensaje de usuario.
-    """
+    # 1) Log crudo (así vemos qué llega)
+    print("=== INCOMING WEBHOOK ===")
+    print(json.dumps(payload, ensure_ascii=False)[:4000])  # recorta para no explotar logs
+
+    # 2) Ignorar statuses (no son mensajes)
     try:
-        entry = payload.get("entry", [])[0]
-        changes = entry.get("changes", [])[0]
-        value = changes.get("value", {})
+        entry = payload.get("entry", [])
+        if not entry:
+            return {"ok": True}
+
+        changes = entry[0].get("changes", [])
+        if not changes:
+            return {"ok": True}
+
+        value = changes[0].get("value", {})
+
+        # Si es status update, salimos
+        if "statuses" in value and "messages" not in value:
+            print("Webhook status update (ignored)")
+            return {"ok": True}
+
         messages = value.get("messages", [])
         if not messages:
-            return {"ok": True}  # statuses u otros eventos
+            print("No messages key found (ignored)")
+            return {"ok": True}
 
         msg = messages[0]
-        from_phone = msg.get("from")  # teléfono del cliente
-        text = (msg.get("text") or {}).get("body", "")
+        from_number = msg.get("from")
+        msg_type = msg.get("type")
 
-        log_message(from_phone, "in", text)
+        text_body = None
+        if msg_type == "text":
+            text_body = msg.get("text", {}).get("body")
 
-        # si está derivado a humano, no respondemos automático
-        if get_handoff(from_phone):
-            return {"ok": True, "handoff": True}
+        print(f"Parsed message -> from={from_number} type={msg_type} text={text_body}")
 
-        reply = route_message(text)
-        if reply.handoff:
-            set_handoff(from_phone, True)
+        if not from_number:
+            return {"ok": True}
 
-        await send_text_message(
-            token=WHATSAPP_TOKEN,
-            phone_number_id=PHONE_NUMBER_ID,
-            to=from_phone,
-            text=reply.text
-        )
-        log_message(from_phone, "out", reply.text)
+        # 3) Si no es texto, respondemos algo corto
+        if not text_body:
+            await send_text_message(from_number, "👋 Por ahora solo entiendo mensajes de texto. Mandame 'menu'.")
+            return {"ok": True}
+
+        # 4) Ruteo principal
+        reply = route_message(from_number, text_body)  # si es async, poné await
+        await send_text_message(from_number, reply)
         return {"ok": True}
+
     except Exception as e:
-        # para debug en Render/Railway se ve en logs
-        return {"ok": False, "error": str(e)}
+        print("ERROR processing webhook:", repr(e))
+        return {"ok": True}
+
 
 @app.get("/")
 def health():
